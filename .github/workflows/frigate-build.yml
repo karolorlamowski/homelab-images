@@ -2,7 +2,7 @@ name: Build Frigate (Hailo 4.23)
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   workflow_dispatch:
     inputs:
       force_build:
@@ -37,19 +37,40 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Detected Frigate release: ${TAG}"
 
+      - name: Resolve tag info
+        id: tag_info
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          if [[ "${BRANCH}" == "main" ]]; then
+            echo "tag_suffix=" >> "$GITHUB_OUTPUT"
+            echo "is_main=true" >> "$GITHUB_OUTPUT"
+          else
+            SLUG=$(echo "${BRANCH}" | tr '[:upper:]' '[:lower:]' | tr '/_' '-' | sed 's/[^a-z0-9-]//g')
+            echo "tag_suffix=-${SLUG}" >> "$GITHUB_OUTPUT"
+            echo "is_main=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Branch: ${BRANCH}, is_main: $([[ "${BRANCH}" == "main" ]] && echo true || echo false)"
+
       - name: Check if image tag already exists in GHCR
         id: check_built
         run: |
           VERSION="${{ steps.frigate_release.outputs.version }}"
+          SUFFIX="${{ steps.tag_info.outputs.tag_suffix }}"
           FORCE="${{ github.event.inputs.force_build }}"
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://ghcr.io/v2/${{ env.IMAGE_NAME }}/manifests/${VERSION}")
-          echo "GHCR manifest status for ${VERSION}: ${HTTP_STATUS}"
-          if [[ "${HTTP_STATUS}" == "200" && "${FORCE}" != "true" ]]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
+          IS_MAIN="${{ steps.tag_info.outputs.is_main }}"
+          if [[ "${IS_MAIN}" != "true" ]]; then
+            echo "Feature branch — always building"
             echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://ghcr.io/v2/${{ env.IMAGE_NAME }}/manifests/${VERSION}")
+            echo "GHCR manifest status for ${VERSION}: ${HTTP_STATUS}"
+            if [[ "${HTTP_STATUS}" == "200" && "${FORCE}" != "true" ]]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Set up QEMU (multi-arch)
@@ -78,14 +99,14 @@ jobs:
           build-args: |
             FRIGATE_VERSION=${{ steps.frigate_release.outputs.version }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.frigate_release.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.frigate_release.outputs.version }}${{ steps.tag_info.outputs.tag_suffix }}
+            ${{ steps.tag_info.outputs.is_main == 'true' && format('{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME) || '' }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Frigate NVR with custom Hailo support
-            org.opencontainers.image.version=${{ steps.frigate_release.outputs.version }}
+            org.opencontainers.image.version=${{ steps.frigate_release.outputs.version }}${{ steps.tag_info.outputs.tag_suffix }}
 
       - name: Skip notification
         if: steps.check_built.outputs.skip == 'true'
