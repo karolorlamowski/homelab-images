@@ -15,5 +15,6 @@ RUN set -eux; \
     pip uninstall hailort -y 2>/dev/null || true; \
     wget -qO- "https://github.com/frigate-nvr/hailort/releases/download/v${HAILO_VERSION}/hailort-debian12-${TARGETARCH}.tar.gz" \
         | tar -C / -xzf -; \
+    ldconfig; \
     pip install --no-cache-dir \
         "https://github.com/frigate-nvr/hailort/releases/download/v${HAILO_VERSION}/hailort-${HAILO_VERSION}-cp311-cp311-linux_${arch}.whl"
