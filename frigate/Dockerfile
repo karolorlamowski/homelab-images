@@ -4,6 +4,7 @@ FROM ghcr.io/blakeblackshear/frigate:${FRIGATE_VERSION}
 
 ARG HAILO_VERSION=4.23.0
 ARG TARGETARCH
+ARG PIP_BREAK_SYSTEM_PACKAGES=1
 
 RUN set -eux; \
     case "${TARGETARCH}" in \
