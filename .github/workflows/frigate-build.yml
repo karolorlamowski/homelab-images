@@ -1,113 +1,191 @@
-name: Build Frigate (Hailo 4.23)
+name: Build Frigate (Hailo)
 
 on:
   push:
     branches: ['**']
+  schedule:
+    - cron: '17 4 * * *'
   workflow_dispatch:
     inputs:
       force_build:
-        description: "Force build even if version already exists in registry"
+        description: "Rebuild even if the image already exists in the registry"
         required: false
         type: boolean
         default: false
+      versions:
+        description: "Comma-separated Frigate versions to build (default: every release >= MIN_FRIGATE_VERSION)"
+        required: false
+        type: string
+        default: ""
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/frigate
+  UPSTREAM_REPO: blakeblackshear/frigate
+  # Oldest Frigate release we build. Every stable release from here up is built automatically.
+  MIN_FRIGATE_VERSION: 0.17.1
+
+concurrency:
+  group: frigate-build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  check-and-build:
+  resolve:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      hailo_version: ${{ steps.plan.outputs.hailo_version }}
 
     steps:
       - name: Checkout homelab-images
         uses: actions/checkout@v4
 
-      - name: Get latest Frigate release
-        id: frigate_release
+      - name: Plan builds
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event.inputs.force_build }}
+          REQUESTED: ${{ github.event.inputs.versions }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          TAG=$(curl -s "https://api.github.com/repos/blakeblackshear/frigate/releases/latest" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            | jq -r '.tag_name')
-          VERSION="${TAG#v}"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Detected Frigate release: ${TAG}"
+          set -euo pipefail
 
-      - name: Resolve tag info
-        id: tag_info
-        run: |
-          BRANCH="${{ github.ref_name }}"
-          if [[ "${BRANCH}" == "main" ]]; then
-            echo "tag_suffix=" >> "$GITHUB_OUTPUT"
-            echo "is_main=true" >> "$GITHUB_OUTPUT"
-          else
-            SLUG=$(echo "${BRANCH}" | tr '[:upper:]' '[:lower:]' | tr '/_' '-' | sed 's/[^a-z0-9-]//g')
-            echo "tag_suffix=-${SLUG}" >> "$GITHUB_OUTPUT"
-            echo "is_main=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Branch: ${BRANCH}, is_main: $([[ "${BRANCH}" == "main" ]] && echo true || echo false)"
+          HAILO=$(sed -n 's/^ARG HAILO_VERSION=//p' frigate/Dockerfile)
+          [[ -n "${HAILO}" ]] || { echo "::error::HAILO_VERSION not found in frigate/Dockerfile"; exit 1; }
+          IMAGE="${IMAGE_NAME,,}"
+          echo "hailo_version=${HAILO}" >> "$GITHUB_OUTPUT"
 
-      - name: Check if image tag already exists in GHCR
-        id: check_built
-        run: |
-          VERSION="${{ steps.frigate_release.outputs.version }}"
-          SUFFIX="${{ steps.tag_info.outputs.tag_suffix }}"
-          FORCE="${{ github.event.inputs.force_build }}"
-          IS_MAIN="${{ steps.tag_info.outputs.is_main }}"
-          if [[ "${IS_MAIN}" != "true" ]]; then
-            echo "Feature branch — always building"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          else
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              "https://ghcr.io/v2/${{ env.IMAGE_NAME }}/manifests/${VERSION}")
-            echo "GHCR manifest status for ${VERSION}: ${HTTP_STATUS}"
-            if [[ "${HTTP_STATUS}" == "200" && "${FORCE}" != "true" ]]; then
-              echo "skip=true" >> "$GITHUB_OUTPUT"
+          # ver_ge A B -> true when A >= B
+          ver_ge() { [[ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" == "$2" ]]; }
+
+          ghcr_token() { # repo [user:token]
+            curl -fsS ${2:+-u "$2"} "https://ghcr.io/token?scope=repository:$1:pull" | jq -r .token
+          }
+          manifest_status() { # repo tag token
+            curl -s -o /dev/null -w '%{http_code}' -I \
+              -H "Authorization: Bearer $3" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/$1/manifests/$2"
+          }
+
+          UPSTREAM_TOKEN=$(ghcr_token "${UPSTREAM_REPO}")
+          OWN_TOKEN=$(ghcr_token "${IMAGE}" "${REGISTRY_AUTH}" || true)
+
+          # Stable upstream releases >= MIN whose upstream image is already published.
+          ELIGIBLE=()
+          while read -r v; do
+            ver_ge "$v" "${MIN_FRIGATE_VERSION}" || continue
+            status=$(manifest_status "${UPSTREAM_REPO}" "$v" "${UPSTREAM_TOKEN}")
+            if [[ "$status" == "200" ]]; then
+              ELIGIBLE+=("$v")
             else
-              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::Upstream image ${UPSTREAM_REPO}:$v not available yet (HTTP $status), skipping"
             fi
+          done < <(gh api "repos/${UPSTREAM_REPO}/releases" --paginate \
+                     -q '.[] | select((.draft or .prerelease) | not) | .tag_name' \
+                   | sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' | sort -uV)
+
+          (( ${#ELIGIBLE[@]} )) || { echo "::error::No eligible Frigate releases found"; exit 1; }
+          LATEST="${ELIGIBLE[-1]}"
+          echo "Eligible: ${ELIGIBLE[*]} (latest ${LATEST}), HailoRT ${HAILO}"
+
+          # Highest patch release per major.minor gets the floating minor tag.
+          declare -A MINOR_TOP
+          for v in "${ELIGIBLE[@]}"; do MINOR_TOP["${v%.*}"]="$v"; done
+
+          if [[ -n "${REQUESTED}" ]]; then
+            IFS=', ' read -r -a CANDIDATES <<< "${REQUESTED}"
+          else
+            CANDIDATES=("${ELIGIBLE[@]}")
           fi
+
+          ENTRIES=()
+          if [[ "${BRANCH}" != "main" ]]; then
+            # Feature branches: only the newest (or requested) version, branch-suffixed, always built.
+            SLUG=$(echo "${BRANCH}" | tr '[:upper:]' '[:lower:]' | tr '/_' '-' | sed 's/[^a-z0-9-]//g')
+            [[ -n "${REQUESTED}" ]] || CANDIDATES=("${LATEST}")
+            for v in "${CANDIDATES[@]}"; do
+              ENTRIES+=("$v|${REGISTRY}/${IMAGE}:${v}-${SLUG}")
+            done
+          else
+            for v in "${CANDIDATES[@]}"; do
+              status=$(manifest_status "${IMAGE}" "${v}-hailo${HAILO}" "${OWN_TOKEN}")
+              if [[ "$status" == "200" && "${FORCE}" != "true" ]]; then
+                echo "${v}-hailo${HAILO} already in registry, skipping"
+                continue
+              fi
+              [[ "$status" == "200" || "$status" == "404" ]] \
+                || echo "::warning::Unexpected registry status ${status} for ${v}-hailo${HAILO}, building"
+              tags="${REGISTRY}/${IMAGE}:${v}-hailo${HAILO},${REGISTRY}/${IMAGE}:${v}"
+              [[ "${MINOR_TOP[${v%.*}]:-}" == "$v" ]] && tags+=",${REGISTRY}/${IMAGE}:${v%.*}"
+              [[ "$v" == "${LATEST}" ]] && tags+=",${REGISTRY}/${IMAGE}:latest"
+              ENTRIES+=("$v|$tags")
+            done
+          fi
+
+          MATRIX=$(printf '%s\n' "${ENTRIES[@]}" | jq -Rnc \
+            '[inputs | select(length > 0) | split("|") | {version: .[0], tags: .[1]}]')
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Frigate builds (HailoRT ${HAILO})"
+            echo "Eligible upstream releases: ${ELIGIBLE[*]}"
+            echo
+            if [[ "${MATRIX}" == "[]" ]]; then
+              echo "Nothing to build — all images already exist."
+            else
+              echo "| Frigate | Tags |"
+              echo "|---|---|"
+              jq -r '.[] | "| \(.version) | \(.tags | gsub(","; "<br>")) |"' <<< "${MATRIX}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+
+    steps:
+      - name: Checkout homelab-images
+        uses: actions/checkout@v4
 
       - name: Set up QEMU (multi-arch)
-        if: steps.check_built.outputs.skip == 'false'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        if: steps.check_built.outputs.skip == 'false'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Container Registry
-        if: steps.check_built.outputs.skip == 'false'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
-        if: steps.check_built.outputs.skip == 'false'
+      - name: Build and push Frigate ${{ matrix.version }}
         uses: docker/build-push-action@v6
         with:
           context: frigate
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            FRIGATE_VERSION=${{ steps.frigate_release.outputs.version }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.frigate_release.outputs.version }}${{ steps.tag_info.outputs.tag_suffix }}
-            ${{ steps.tag_info.outputs.is_main == 'true' && format('{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME) || '' }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+            FRIGATE_VERSION=${{ matrix.version }}
+          tags: ${{ matrix.tags }}
+          cache-from: type=gha,scope=frigate-${{ matrix.version }}
+          cache-to: type=gha,scope=frigate-${{ matrix.version }},mode=max
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=Frigate NVR with custom Hailo support
-            org.opencontainers.image.version=${{ steps.frigate_release.outputs.version }}${{ steps.tag_info.outputs.tag_suffix }}
-
-      - name: Skip notification
-        if: steps.check_built.outputs.skip == 'true'
-        run: echo "Frigate ${{ steps.frigate_release.outputs.tag }} already built. Skipping."
+            org.opencontainers.image.description=Frigate NVR ${{ matrix.version }} with HailoRT ${{ needs.resolve.outputs.hailo_version }}
+            org.opencontainers.image.version=${{ matrix.version }}-hailo${{ needs.resolve.outputs.hailo_version }}
