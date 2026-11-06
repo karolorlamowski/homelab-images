@@ -28,8 +28,9 @@ Key variables in `frigate/Dockerfile`:
 ## CI behaviour
 
 - Triggers: push to any branch, daily `schedule`, manual `workflow_dispatch` (`force_build`, `versions`)
-- `resolve` job lists stable upstream releases ≥ `MIN_FRIGATE_VERSION` (workflow env) whose upstream GHCR image exists, and emits a matrix of versions whose `<version>-hailo<HAILO_VERSION>` tag is missing in our GHCR
+- `resolve` job lists stable upstream releases ≥ `MIN_FRIGATE_VERSION` (workflow env), published at least `MIN_RELEASE_AGE_DAYS` ago, whose upstream GHCR image exists, and emits a matrix of versions whose `<version>-hailo<HAILO_VERSION>` tag is missing in our GHCR
 - `build` job builds each matrix entry (amd64 + arm64); main tags: `<version>-hailo<hv>`, `<version>`, `<major.minor>` (newest patch only), `latest` (newest release only)
+- `MIN_RELEASE_AGE_DAYS` is the release-age guard for this image. homelab-infra's Renovate exempts `ghcr.io/karolorlamowski/frigate` from `minimumReleaseAge`, because Renovate gets no release timestamps from GHCR — so don't drop the gate here without adding one there. Manual dispatch with `versions` bypasses it
 - Feature branches: only the newest version, tagged `<version>-<branch-slug>`, always built
 - Uses GitHub Actions cache, scoped per Frigate version
 - Requires **Read and write permissions** under Settings → Actions → General → Workflow permissions
